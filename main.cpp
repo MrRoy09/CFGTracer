@@ -6,63 +6,33 @@
 #include <iostream>
 #include <capstone/capstone.h>
 #include <set>
+#include "elf_parser.h"
 
-struct ELFFile
+struct Instruction
 {
-    std::vector<uint8_t> data;
-    uint64_t entry_offset;
+    uint64_t address;
+    std::string mnemonic;
+    std::string op_str;
+    cs_detail *details;
 };
 
-bool loadELF(const std::string &filename, ELFFile &elfFile)
+struct Block
 {
-    std::ifstream file(filename, std::ios::binary | std::ios::ate);
-    if (!file)
-    {
-        std::cerr << "Failed to open ELF file: " << filename << "\n";
-        return false;
-    }
+    uint64_t start_address;
+    uint64_t end_address;
+    std::vector<Instruction> instructions;
+    std::set<uint64_t> successors;
+    std::set<uint64_t> predecessors;
+    bool isReturn;
+};
 
-    std::streamsize size = file.tellg();
-    file.seekg(0, std::ios::beg);
-    elfFile.data.resize(size);
-
-    if (!file.read(reinterpret_cast<char *>(elfFile.data.data()), size))
-    {
-        std::cerr << "Failed to read ELF file." << std::endl;
-        return false;
-    }
-
-    return true;
-}
-
-bool getEntryOffset(ELFFile &elfFile)
+struct Function
 {
-    if (elfFile.data.size() < sizeof(Elf64_Ehdr))
-    {
-        std::cerr << "Invalid ELF file." << std::endl;
-        return false;
-    }
-
-    Elf64_Ehdr *header = reinterpret_cast<Elf64_Ehdr *>(elfFile.data.data());
-    Elf64_Phdr *program_headers = reinterpret_cast<Elf64_Phdr *>(elfFile.data.data() + header->e_phoff);
-
-    uint64_t entry_point = header->e_entry;
-    uint64_t entry_offset = 0;
-
-    for (int i = 0; i < header->e_phnum; i++)
-    {
-        Elf64_Phdr &ph = program_headers[i];
-        if (ph.p_type == PT_LOAD && ph.p_vaddr <= entry_point && entry_point < ph.p_vaddr + ph.p_memsz)
-        {
-            entry_offset = entry_point - ph.p_vaddr + ph.p_offset;
-            elfFile.entry_offset = entry_offset;
-            return true;
-        }
-    }
-
-    std::cerr << "Entry offset not found." << std::endl;
-    return false;
-}
+    std::string name;
+    uint64_t start_address;
+    uint64_t end_address;
+    std::vector<Block> blocks;
+};
 
 bool check_visited(uint64_t offset, std::set<uint64_t> &visited)
 {
@@ -80,37 +50,108 @@ void printBytes(ELFFile &elfFile, uint64_t offset, size_t count)
     }
 }
 
+void printInstructions(const std::vector<Instruction> &instructions)
+{
+    std::cout << "\nDisassembled Instructions:\n";
+    std::cout << "---------------------------------------------\n";
+    for (const auto &instr : instructions)
+    {
+        printf("0x%08" PRIx64 ": %-8s %s\n", instr.address, instr.mnemonic.c_str(), instr.op_str.c_str());
+    }
+    std::cout << "---------------------------------------------\n";
+}
+
+void disassemble_function(csh handle, ELFFile &elfFile, uint64_t address, std::set<uint64_t> &visited, std::vector<Block> &blocks);
+
 void disassemble(ELFFile &elfFile)
 {
     csh handle;
-    cs_insn *insn;
-    size_t count;
 
     if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK)
-        printf("Failed to initialize capstone handle\n");
-
-    std::vector<uint64_t> worklist = {elfFile.entry_offset};
-    std::set<uint64_t> visited;
-
-    while (!worklist.empty())
     {
-        uint64_t address = worklist.back();
-        worklist.pop_back();
-        count = cs_disasm(handle, elfFile.data.data() + address, elfFile.data.size(), address, 1, &insn);
-
-        if (count > 0)
-        {
-            printf("0x%" PRIx64 ":\t%s\t\t%s\n", insn[0].address, insn[0].mnemonic,insn[0].op_str);
-            worklist.emplace_back(address + insn[0].size);
-            cs_free(insn, count);
-        }
-        else
-        {
-            printf("ERROR: Failed to disassemble given code at offset 0x%lx\n", address);
-            address++;
-        }
+        printf("Failed to initialize capstone handle\n");
+        return;
     }
+
+    cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+    std::vector<Block> blocks;
+    std::set<uint64_t> visited;
+    disassemble_function(handle, elfFile, elfFile.entry_offset, visited, blocks);
     cs_close(&handle);
+}
+
+void disassemble_function(csh handle, ELFFile &elfFile, uint64_t address, std::set<uint64_t> &visited, std::vector<Block> &blocks)
+{
+    if (visited.find(address) != visited.end())
+    {
+        return;
+    }
+    visited.insert(address);
+    Function function;
+    function.start_address = address;
+
+    while (true)
+    {
+        std::vector<Instruction> instructions;
+        Block block = disassemble_block(handle, elfFile, address, visited, instructions);
+        if(block.isReturn){
+            break;
+        }
+        address = block.end_address;
+    }
+}
+
+Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t address, std::set<uint64_t> visited, std::vector<Instruction> &instructions)
+{
+    if (visited.find(address) != visited.end())
+    {
+        return {};
+    }
+
+    visited.insert(address);
+    Block block;
+    block.start_address = address;
+    cs_insn *insn;
+
+    while (true)
+    {
+        size_t count = cs_disasm(handle, elfFile.data.data() + address, elfFile.data.size() - address, address, 1, &insn);
+
+        if (count == 0)
+        {
+            std::cerr << "Disassembly error at: 0x" << std::hex << address << std::endl;
+            break;
+        }
+
+        Instruction instr;
+        instr.address = insn[0].address;
+        instr.mnemonic = insn[0].mnemonic;
+        instr.op_str = insn[0].op_str;
+        instr.details = insn[0].detail;
+
+        block.instructions.push_back(instr);
+        uint64_t next_address = address + insn[0].size;
+
+        if (instr.mnemonic == "jmp")
+        {
+            cs_x86_op op = instr.details->x86.operands[0];
+            if (op.type != X86_OP_IMM)
+            {
+                continue;
+            }
+            block.end_address = next_address;
+            block.isReturn = 0;
+            return block;
+        }
+
+        if (instr.mnemonic == "ret")
+        {
+            block.end_address = next_address;
+            block.isReturn = 1;
+            return block;
+        }
+        address = next_address;
+    }
 }
 
 int main(int argc, char *argv[])
