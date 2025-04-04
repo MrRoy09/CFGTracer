@@ -23,7 +23,7 @@ struct Block
     std::vector<Instruction> instructions;
     std::set<uint64_t> successors;
     std::set<uint64_t> predecessors;
-    bool isReturn;
+    bool isReturn = false;
 };
 
 struct Function
@@ -36,18 +36,7 @@ struct Function
 
 bool check_visited(uint64_t offset, std::set<uint64_t> &visited)
 {
-    if (visited.empty())
-        return false;
-    return visited.count(offset);
-}
-
-void printBytes(ELFFile &elfFile, uint64_t offset, size_t count)
-{
-    printf("hello\n");
-    for (size_t i = 0; i < count; i++)
-    {
-        printf("%02X ", elfFile.data[offset + i]);
-    }
+    return visited.count(offset) > 0;
 }
 
 void printInstructions(const std::vector<Instruction> &instructions)
@@ -61,61 +50,61 @@ void printInstructions(const std::vector<Instruction> &instructions)
     std::cout << "---------------------------------------------\n";
 }
 
+Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t address, std::set<uint64_t> &visited);
 void disassemble_function(csh handle, ELFFile &elfFile, uint64_t address, std::set<uint64_t> &visited, std::vector<Block> &blocks);
 
 void disassemble(ELFFile &elfFile)
 {
     csh handle;
-
     if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK)
     {
-        printf("Failed to initialize capstone handle\n");
+        std::cerr << "Failed to initialize Capstone handle\n";
         return;
     }
 
     cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
-    std::vector<Block> blocks;
+
     std::set<uint64_t> visited;
+    std::vector<Block> blocks;
+
     disassemble_function(handle, elfFile, elfFile.entry_offset, visited, blocks);
+
+    for (auto &block : blocks)
+    {
+        printInstructions(block.instructions);
+    }
+
     cs_close(&handle);
 }
 
 void disassemble_function(csh handle, ELFFile &elfFile, uint64_t address, std::set<uint64_t> &visited, std::vector<Block> &blocks)
 {
-    if (visited.find(address) != visited.end())
-    {
-        return;
-    }
-    visited.insert(address);
-    Function function;
-    function.start_address = address;
 
     while (true)
     {
-        std::vector<Instruction> instructions;
-        Block block = disassemble_block(handle, elfFile, address, visited, instructions);
-        if(block.isReturn){
+        Block block = disassemble_block(handle, elfFile, address, visited);
+        if (block.instructions.empty())
             break;
-        }
+
+        blocks.push_back(block);
+        if (block.isReturn)
+            break;
+
         address = block.end_address;
     }
 }
 
-Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t address, std::set<uint64_t> visited, std::vector<Instruction> &instructions)
+Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t address, std::set<uint64_t> &visited)
 {
-    if (visited.find(address) != visited.end())
-    {
-        return {};
-    }
-
-    visited.insert(address);
     Block block;
     block.start_address = address;
-    cs_insn *insn;
+
+    cs_insn *insn = nullptr;
 
     while (true)
     {
-        size_t count = cs_disasm(handle, elfFile.data.data() + address, elfFile.data.size() - address, address, 1, &insn);
+        size_t count = cs_disasm(handle, elfFile.data.data() + address,
+                                 elfFile.data.size() - address, address, 1, &insn);
 
         if (count == 0)
         {
@@ -134,24 +123,42 @@ Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t address, std::set
 
         if (instr.mnemonic == "jmp")
         {
-            cs_x86_op op = instr.details->x86.operands[0];
-            if (op.type != X86_OP_IMM)
+            if (instr.details->x86.op_count > 0)
             {
-                continue;
+                cs_x86_op op = instr.details->x86.operands[0];
+                if (op.type == X86_OP_IMM)
+                {
+                    block.successors.insert(op.imm);
+                }
             }
             block.end_address = next_address;
-            block.isReturn = 0;
+            block.isReturn = false;
+            cs_free(insn, count);
             return block;
         }
 
         if (instr.mnemonic == "ret")
         {
             block.end_address = next_address;
-            block.isReturn = 1;
+            block.isReturn = true;
+            cs_free(insn, count);
             return block;
         }
+
+        if (instr.mnemonic == "hlt")
+        {
+            block.end_address = next_address;
+            block.isReturn = true;
+            cs_free(insn, count);
+            return block;
+        }
+
         address = next_address;
+        cs_free(insn, count);
     }
+
+    block.end_address = address;
+    return block;
 }
 
 int main(int argc, char *argv[])
@@ -165,11 +172,13 @@ int main(int argc, char *argv[])
     ELFFile elfFile;
     if (!loadELF(argv[1], elfFile))
     {
+        std::cerr << "Failed to load ELF file.\n";
         return 1;
     }
 
     if (!getEntryOffset(elfFile))
     {
+        std::cerr << "Failed to get entry offset.\n";
         return 1;
     }
 
