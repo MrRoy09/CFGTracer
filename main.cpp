@@ -6,6 +6,7 @@
 #include <iostream>
 #include <capstone/capstone.h>
 #include <set>
+#include <map>
 #include "elf_parser.h"
 
 struct Instruction
@@ -50,10 +51,10 @@ void printInstructions(const std::vector<Instruction> &instructions)
     std::cout << "---------------------------------------------\n";
 }
 
-Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t address, std::set<uint64_t> &visited);
-void disassemble_function(csh handle, ELFFile &elfFile, uint64_t address, std::set<uint64_t> &visited, std::vector<Block> &blocks);
+Block disassemble_block(csh handle, ELFFile &elfFile, std::map<uint64_t, uint8_t> &visited);
+void disassemble_function(csh handle, ELFFile &elfFile, std::vector<Block> &blocks);
 
-void disassemble(ELFFile &elfFile)
+void disassemble_symbols(ELFFile &elfFile, std::vector<Symbol> &symbols)
 {
     csh handle;
     if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK)
@@ -64,25 +65,32 @@ void disassemble(ELFFile &elfFile)
 
     cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
 
-    std::set<uint64_t> visited;
-    std::vector<Block> blocks;
-
-    disassemble_function(handle, elfFile, elfFile.entry_offset, visited, blocks);
-
-    for (auto &block : blocks)
+    for (auto &i : symbols)
     {
-        printInstructions(block.instructions);
+        if (!i.executable)
+        {
+            continue;
+        }
+        elfFile.current_offset = i.address;
+        std::vector<Block> blocks;
+        disassemble_function(handle, elfFile, blocks);
+        printf("\nDisassembled %s", i.name.c_str());
+        for (auto &block : blocks)
+        {
+            printInstructions(block.instructions);
+        }
     }
 
     cs_close(&handle);
 }
 
-void disassemble_function(csh handle, ELFFile &elfFile, uint64_t address, std::set<uint64_t> &visited, std::vector<Block> &blocks)
+void disassemble_function(csh handle, ELFFile &elfFile, std::vector<Block> &blocks)
 {
 
     while (true)
     {
-        Block block = disassemble_block(handle, elfFile, address, visited);
+        std::map<uint64_t, uint8_t> visited;
+        Block block = disassemble_block(handle, elfFile, visited);
         if (block.instructions.empty())
             break;
 
@@ -90,25 +98,30 @@ void disassemble_function(csh handle, ELFFile &elfFile, uint64_t address, std::s
         if (block.isReturn)
             break;
 
-        address = block.end_address;
+        elfFile.current_offset = block.end_address;
     }
 }
 
-Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t address, std::set<uint64_t> &visited)
+Block disassemble_block(csh handle, ELFFile &elfFile, std::map<uint64_t, uint8_t> &visited)
 {
     Block block;
-    block.start_address = address;
-
+    block.start_address = elfFile.current_offset;
     cs_insn *insn = nullptr;
 
     while (true)
     {
-        size_t count = cs_disasm(handle, elfFile.data.data() + address,
-                                 elfFile.data.size() - address, address, 1, &insn);
+        if (visited.count(elfFile.current_offset))
+        {
+            elfFile.current_offset += visited.find(elfFile.current_offset)->second;
+            continue;
+        }
+
+        size_t count = cs_disasm(handle, elfFile.data.data() + elfFile.current_offset,
+                                 elfFile.data.size() - elfFile.current_offset, elfFile.current_offset, 1, &insn);
 
         if (count == 0)
         {
-            std::cerr << "Disassembly error at: 0x" << std::hex << address << std::endl;
+            std::cerr << "Disassembly error at: 0x" << std::hex << elfFile.current_offset << std::endl;
             break;
         }
 
@@ -119,7 +132,8 @@ Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t address, std::set
         instr.details = insn[0].detail;
 
         block.instructions.push_back(instr);
-        uint64_t next_address = address + insn[0].size;
+        uint64_t next_address = elfFile.current_offset + insn[0].size;
+        visited.insert({elfFile.current_offset, insn[0].size});
 
         if (instr.mnemonic == "jmp")
         {
@@ -135,6 +149,23 @@ Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t address, std::set
             block.isReturn = false;
             cs_free(insn, count);
             return block;
+        }
+
+        else if (instr.mnemonic == "jge")
+        {
+            if (instr.details->x86.op_count > 0)
+            {
+                cs_x86_op op = instr.details->x86.operands[0];
+                if (op.type == X86_OP_IMM)
+                {
+                    block.successors.insert(op.imm);
+                    block.successors.insert(elfFile.current_offset + insn[0].size);
+                }
+                block.end_address = next_address;
+                block.isReturn = false;
+                cs_free(insn, count);
+                return block;
+            }
         }
 
         if (instr.mnemonic == "ret")
@@ -153,11 +184,11 @@ Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t address, std::set
             return block;
         }
 
-        address = next_address;
+        elfFile.current_offset = next_address;
         cs_free(insn, count);
     }
 
-    block.end_address = address;
+    block.end_address = elfFile.current_offset;
     return block;
 }
 
@@ -183,6 +214,8 @@ int main(int argc, char *argv[])
     }
 
     std::cout << "Entry offset: 0x" << std::hex << elfFile.entry_offset << std::endl;
-    disassemble(elfFile);
+    elfFile.current_offset = elfFile.entry_offset;
+    std::vector<Symbol> symbols = parseSymbolTable(elfFile);
+    disassemble_symbols(elfFile, symbols);
     return 0;
 }

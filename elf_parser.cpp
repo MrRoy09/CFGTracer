@@ -59,38 +59,70 @@ bool getEntryOffset(ELFFile &elfFile)
     return false;
 }
 
-bool getSymbolTable(ELFFile &elfFile){
-     if (elfFile.data.size() < sizeof(Elf64_Ehdr))
+std::vector<Symbol> parseSymbolTable(ELFFile &elfFile)
+{
+    std::vector<Symbol> symbols;
+
+    if (elfFile.data.size() < sizeof(Elf64_Ehdr))
     {
         std::cerr << "Invalid ELF file." << std::endl;
-        return false;
+        return symbols;
     }
 
     Elf64_Ehdr *header = reinterpret_cast<Elf64_Ehdr *>(elfFile.data.data());
+    Elf64_Shdr *section_headers = reinterpret_cast<Elf64_Shdr *>(elfFile.data.data() + header->e_shoff);
+    const char *shstrtab = reinterpret_cast<const char *>(elfFile.data.data() + section_headers[header->e_shstrndx].sh_offset);
 
-    uint64_t section_offset = header->e_shoff;
-    uint64_t number_sections = header->e_shnum;
-    size_t size_section = header->e_shentsize;
+    for (int i = 0; i < header->e_shnum; ++i)
+    {
+        Elf64_Shdr &sh = section_headers[i];
+        if (sh.sh_type != SHT_SYMTAB && sh.sh_type != SHT_DYNSYM)
+            continue;
 
-    for(int i = 0; i<number_sections; i++){
-        uint64_t offset = section_offset+i*size_section;
-        Elf64_Shdr* section_header = reinterpret_cast<Elf64_Shdr*>(elfFile.data.data()+offset);
+        const Elf64_Sym *symtab = reinterpret_cast<const Elf64_Sym *>(elfFile.data.data() + sh.sh_offset);
+        size_t symbol_count = sh.sh_size / sizeof(Elf64_Sym);
 
-        if(section_header->sh_type == SHT_DYNSYM){
-            elfFile.dymsym_header_offset = offset;
-        }
-        else if(section_header->sh_type ==SHT_SYMTAB){
-            elfFile.sym_header_offset = offset;
+        const Elf64_Shdr &strtab_section = section_headers[sh.sh_link];
+        const char *strtab = reinterpret_cast<const char *>(elfFile.data.data() + strtab_section.sh_offset);
+
+        for (size_t j = 0; j < symbol_count; ++j)
+        {
+            const Elf64_Sym &sym = symtab[j];
+            if (sym.st_name == 0)
+                continue;
+
+            Symbol s;
+            Elf64_Shdr section;
+            s.name = std::string(strtab + sym.st_name);
+            s.address = sym.st_value;
+            s.size = sym.st_size;
+            s.info = sym.st_info;
+            s.section_index = sym.st_shndx;
+            if (s.section_index <= header->e_shnum)
+            {
+                section = section_headers[s.section_index];
+                if ((section.sh_flags & SHF_EXECINSTR))
+                {
+                    s.executable = 1;
+                }
+                else
+                {
+                    s.executable = 0;
+                }
+            }
+            symbols.push_back(s);
         }
     }
-
-    return true;
+    return symbols;
 }
 
-std::string getSymbolAddress(ELFFile &elfFile, std::string name){
-    
+void printSymbolNames(const std::vector<Symbol> &symbols)
+{
+    std::cout << "\nSymbols:\n";
+    std::cout << "-----------------------------\n";
+    for (const auto &sym : symbols)
+    {
+        std::cout << sym.name << " @ 0x" << std::hex << sym.address << std::dec << "\n";
+    }
+    std::cout << "-----------------------------\n";
 }
-
-
-
-
