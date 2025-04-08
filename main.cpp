@@ -7,6 +7,7 @@
 #include <capstone/capstone.h>
 #include <set>
 #include <map>
+#include <sstream>
 #include "elf_parser.h"
 
 struct Instruction
@@ -15,6 +16,7 @@ struct Instruction
     std::string mnemonic;
     std::string op_str;
     cs_detail *details;
+    uint32_t id;
 };
 
 struct Block
@@ -51,6 +53,42 @@ void printInstructions(const std::vector<Instruction> &instructions)
     std::cout << "---------------------------------------------\n";
 }
 
+void exportCFGToDOT(const std::vector<Block> &blocks, const std::string &filename)
+{
+    std::ofstream out(filename);
+    if (!out.is_open())
+    {
+        std::cerr << "Failed to open file for CFG output.\n";
+        return;
+    }
+
+    out << "digraph CFG {\n";
+    out << "  node [shape=box fontname=\"Courier\"];\n";
+
+    for (const auto &block : blocks)
+    {
+        std::stringstream label;
+        // label << "0x" << std::hex << block.start_address << ":\\l";
+        for (const auto &instr : block.instructions)
+        {
+            label << "0x" << std::hex << instr.address << ": " << instr.mnemonic << " " << instr.op_str << "\\l";
+        }
+
+        out << "  \"" << std::hex << block.start_address << "\" [label=\"" << label.str() << "\"];\n";
+    }
+
+    for (const auto &block : blocks)
+    {
+        for (uint64_t succ : block.successors)
+        {
+            out << "  \"" << std::hex << block.start_address << "\" -> \"" << std::hex << succ << "\";\n";
+        }
+    }
+
+    out << "}\n";
+    out.close();
+}
+
 Block disassemble_block(csh handle, ELFFile &elfFile, std::map<uint64_t, uint8_t> &visited);
 void disassemble_function(csh handle, ELFFile &elfFile, std::vector<Block> &blocks);
 
@@ -74,10 +112,10 @@ void disassemble_symbols(ELFFile &elfFile, std::vector<Symbol> &symbols)
         elfFile.current_offset = i.address;
         std::vector<Block> blocks;
         disassemble_function(handle, elfFile, blocks);
-        printf("\nDisassembled %s", i.name.c_str());
-        for (auto &block : blocks)
+        printf("\nDisassembled %s\n", i.name.c_str());
+        if (i.name == "main")
         {
-            printInstructions(block.instructions);
+            exportCFGToDOT(blocks, "main_cfg");
         }
     }
 
@@ -130,58 +168,38 @@ Block disassemble_block(csh handle, ELFFile &elfFile, std::map<uint64_t, uint8_t
         instr.mnemonic = insn[0].mnemonic;
         instr.op_str = insn[0].op_str;
         instr.details = insn[0].detail;
+        instr.id = insn[0].id;
 
         block.instructions.push_back(instr);
         uint64_t next_address = elfFile.current_offset + insn[0].size;
         visited.insert({elfFile.current_offset, insn[0].size});
 
-        if (instr.mnemonic == "jmp")
+        if (instr.details && instr.details->groups_count > 0)
         {
-            if (instr.details->x86.op_count > 0)
+            for (int i = 0; i < instr.details->groups_count; ++i)
             {
-                cs_x86_op op = instr.details->x86.operands[0];
-                if (op.type == X86_OP_IMM)
+                uint8_t group = instr.details->groups[i];
+                if (group == CS_GRP_JUMP || group == CS_GRP_CALL || group == CS_GRP_RET || group == CS_GRP_INT)
                 {
-                    block.successors.insert(op.imm);
+                    if (group == CS_GRP_JUMP && instr.details->x86.op_count > 0)
+                    {
+                        cs_x86_op op = instr.details->x86.operands[0];
+                        if (op.type == X86_OP_IMM)
+                        {
+                            block.successors.insert(op.imm);
+                        }
+                    }
+
+                    if (instr.mnemonic != "jmp")
+                    {
+                        block.successors.insert(elfFile.current_offset + insn[0].size);
+                    }
+                    block.end_address = next_address;
+                    block.isReturn = (group == CS_GRP_RET || instr.id == X86_INS_HLT);
+                    cs_free(insn, count);
+                    return block;
                 }
             }
-            block.end_address = next_address;
-            block.isReturn = false;
-            cs_free(insn, count);
-            return block;
-        }
-
-        else if (instr.mnemonic == "jge")
-        {
-            if (instr.details->x86.op_count > 0)
-            {
-                cs_x86_op op = instr.details->x86.operands[0];
-                if (op.type == X86_OP_IMM)
-                {
-                    block.successors.insert(op.imm);
-                    block.successors.insert(elfFile.current_offset + insn[0].size);
-                }
-                block.end_address = next_address;
-                block.isReturn = false;
-                cs_free(insn, count);
-                return block;
-            }
-        }
-
-        if (instr.mnemonic == "ret")
-        {
-            block.end_address = next_address;
-            block.isReturn = true;
-            cs_free(insn, count);
-            return block;
-        }
-
-        if (instr.mnemonic == "hlt")
-        {
-            block.end_address = next_address;
-            block.isReturn = true;
-            cs_free(insn, count);
-            return block;
         }
 
         elfFile.current_offset = next_address;
