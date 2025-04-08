@@ -113,7 +113,7 @@ void disassemble_symbols(ELFFile &elfFile, std::vector<Symbol> &symbols)
         std::vector<Block> blocks;
         disassemble_function(handle, elfFile, blocks);
         printf("\nDisassembled %s\n", i.name.c_str());
-        if (i.name == "main")
+        if (i.name == "main") // just for testing
         {
             exportCFGToDOT(blocks, "main_cfg");
         }
@@ -142,6 +142,7 @@ void disassemble_function(csh handle, ELFFile &elfFile, std::vector<Block> &bloc
 
 Block disassemble_block(csh handle, ELFFile &elfFile, std::map<uint64_t, uint8_t> &visited)
 {
+    // slightly unreadable code below, need to re-visit
     Block block;
     block.start_address = elfFile.current_offset;
     cs_insn *insn = nullptr;
@@ -179,7 +180,7 @@ Block disassemble_block(csh handle, ELFFile &elfFile, std::map<uint64_t, uint8_t
             for (int i = 0; i < instr.details->groups_count; ++i)
             {
                 uint8_t group = instr.details->groups[i];
-                if (group == CS_GRP_JUMP || group == CS_GRP_CALL || group == CS_GRP_RET || group == CS_GRP_INT)
+                if (group == CS_GRP_JUMP || group == CS_GRP_CALL || group == CS_GRP_RET || group == CS_GRP_INT || instr.mnemonic =="hlt")
                 {
                     if (group == CS_GRP_JUMP && instr.details->x86.op_count > 0)
                     {
@@ -195,7 +196,7 @@ Block disassemble_block(csh handle, ELFFile &elfFile, std::map<uint64_t, uint8_t
                         block.successors.insert(elfFile.current_offset + insn[0].size);
                     }
                     block.end_address = next_address;
-                    block.isReturn = (group == CS_GRP_RET || instr.id == X86_INS_HLT);
+                    block.isReturn = (group == CS_GRP_RET || instr.mnemonic == "hlt");
                     cs_free(insn, count);
                     return block;
                 }
