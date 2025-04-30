@@ -8,6 +8,7 @@
 #include <set>
 #include <map>
 #include <sstream>
+#include <queue>
 #include "elf_parser.h"
 
 struct Instruction
@@ -34,13 +35,8 @@ struct Function
     std::string name;
     uint64_t start_address;
     uint64_t end_address;
-    std::vector<Block> blocks;
+    std::map<uint64_t, Block> blocks;
 };
-
-bool check_visited(uint64_t offset, std::set<uint64_t> &visited)
-{
-    return visited.count(offset) > 0;
-}
 
 void printInstructions(const std::vector<Instruction> &instructions)
 {
@@ -53,9 +49,9 @@ void printInstructions(const std::vector<Instruction> &instructions)
     std::cout << "---------------------------------------------\n";
 }
 
-void exportCFGToDOT(const std::vector<Block> &blocks, const std::string &filename)
+void exportCFGToDOT(const std::map<uint64_t, Block> &blocks, const std::string &filename)
 {
-    std::ofstream out(filename);
+    std::ofstream out(filename + ".dot");
     if (!out.is_open())
     {
         std::cerr << "Failed to open file for CFG output.\n";
@@ -65,10 +61,9 @@ void exportCFGToDOT(const std::vector<Block> &blocks, const std::string &filenam
     out << "digraph CFG {\n";
     out << "  node [shape=box fontname=\"Courier\"];\n";
 
-    for (const auto &block : blocks)
+    for (const auto &[addr, block] : blocks)
     {
         std::stringstream label;
-        // label << "0x" << std::hex << block.start_address << ":\\l";
         for (const auto &instr : block.instructions)
         {
             label << "0x" << std::hex << instr.address << ": " << instr.mnemonic << " " << instr.op_str << "\\l";
@@ -77,7 +72,7 @@ void exportCFGToDOT(const std::vector<Block> &blocks, const std::string &filenam
         out << "  \"" << std::hex << block.start_address << "\" [label=\"" << label.str() << "\"];\n";
     }
 
-    for (const auto &block : blocks)
+    for (const auto &[addr, block] : blocks)
     {
         for (uint64_t succ : block.successors)
         {
@@ -87,10 +82,11 @@ void exportCFGToDOT(const std::vector<Block> &blocks, const std::string &filenam
 
     out << "}\n";
     out.close();
+    std::cout << "CFG exported to " << filename << ".dot\n";
 }
 
-Block disassemble_block(csh handle, ELFFile &elfFile, std::map<uint64_t, uint8_t> &visited);
-void disassemble_function(csh handle, ELFFile &elfFile, std::vector<Block> &blocks);
+Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t start_address, std::set<uint64_t> &visited_instructions);
+void disassemble_function_recursive(csh handle, ELFFile &elfFile, Function &function, uint64_t start_address);
 
 void disassemble_symbols(ELFFile &elfFile, std::vector<Symbol> &symbols)
 {
@@ -103,65 +99,118 @@ void disassemble_symbols(ELFFile &elfFile, std::vector<Symbol> &symbols)
 
     cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
 
-    for (auto &i : symbols)
+    for (auto &symbol : symbols)
     {
-        if (!i.executable)
+        if (!symbol.executable)
         {
             continue;
         }
-        elfFile.current_offset = i.address;
-        std::vector<Block> blocks;
-        disassemble_function(handle, elfFile, blocks);
-        printf("\nDisassembled %s\n", i.name.c_str());
-        if (i.name == "main") // just for testing
-        {
-            exportCFGToDOT(blocks, "main_cfg");
-        }
+
+        Function function;
+        function.name = symbol.name;
+        function.start_address = symbol.address;
+
+        disassemble_function_recursive(handle, elfFile, function, symbol.address);
+
+        printf("\nDisassembled %s - Found %zu blocks\n", symbol.name.c_str(), function.blocks.size());
+
+        exportCFGToDOT(function.blocks, function.name+".dot");
     }
 
     cs_close(&handle);
 }
 
-void disassemble_function(csh handle, ELFFile &elfFile, std::vector<Block> &blocks)
+void disassemble_function_recursive(csh handle, ELFFile &elfFile, Function &function, uint64_t start_address)
 {
+    std::set<uint64_t> visited_instructions;
+    std::set<uint64_t> pending_addresses;
+    std::set<uint64_t> processed_block_starts;
 
-    while (true)
+    pending_addresses.insert(start_address);
+
+    while (!pending_addresses.empty())
     {
-        std::map<uint64_t, uint8_t> visited;
-        Block block = disassemble_block(handle, elfFile, visited);
-        if (block.instructions.empty())
-            break;
+        uint64_t current_address = *pending_addresses.begin();
+        pending_addresses.erase(pending_addresses.begin());
 
-        blocks.push_back(block);
-        if (block.isReturn)
-            break;
+        if (processed_block_starts.count(current_address) > 0)
+        {
+            continue;
+        }
 
-        elfFile.current_offset = block.end_address;
+        processed_block_starts.insert(current_address);
+
+        bool found_in_block = false;
+        for (const auto &[block_addr, block] : function.blocks)
+        {
+            if (current_address >= block.start_address && current_address < block.end_address)
+            {
+                found_in_block = true;
+                break;
+            }
+        }
+
+        if (found_in_block)
+        {
+            continue;
+        }
+
+        Block block = disassemble_block(handle, elfFile, current_address, visited_instructions);
+
+        if (!block.instructions.empty())
+        {
+            function.blocks[block.start_address] = block;
+
+            for (uint64_t succ : block.successors)
+            {
+                if (function.blocks.count(succ) > 0)
+                {
+                    function.blocks[succ].predecessors.insert(block.start_address);
+                }
+
+                pending_addresses.insert(succ);
+            }
+        }
+    }
+
+    for (auto &[addr, block] : function.blocks)
+    {
+        for (uint64_t succ : block.successors)
+        {
+            if (function.blocks.count(succ) > 0)
+            {
+                function.blocks[succ].predecessors.insert(block.start_address);
+            }
+        }
     }
 }
 
-Block disassemble_block(csh handle, ELFFile &elfFile, std::map<uint64_t, uint8_t> &visited)
+Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t start_address, std::set<uint64_t> &visited_instructions)
 {
-    // slightly unreadable code below, need to re-visit
     Block block;
-    block.start_address = elfFile.current_offset;
+    block.start_address = start_address;
+    uint64_t current_offset = start_address;
     cs_insn *insn = nullptr;
 
     while (true)
     {
-        if (visited.count(elfFile.current_offset))
+        if (visited_instructions.count(current_offset))
         {
-            elfFile.current_offset += visited.find(elfFile.current_offset)->second;
-            continue;
+            block.end_address = current_offset;
+            return block;
         }
 
-        size_t count = cs_disasm(handle, elfFile.data.data() + elfFile.current_offset,
-                                 elfFile.data.size() - elfFile.current_offset, elfFile.current_offset, 1, &insn);
+        size_t count = cs_disasm(handle, elfFile.data.data() + current_offset,
+                                 elfFile.data.size() - current_offset, current_offset, 1, &insn);
 
         if (count == 0)
         {
-            std::cerr << "Disassembly error at: 0x" << std::hex << elfFile.current_offset << std::endl;
-            break;
+            std::cerr << "Disassembly error at: 0x" << std::hex << current_offset << std::endl;
+            if (!block.instructions.empty())
+            {
+                block.end_address = current_offset;
+            }
+            return block;
         }
 
         Instruction instr;
@@ -172,17 +221,22 @@ Block disassemble_block(csh handle, ELFFile &elfFile, std::map<uint64_t, uint8_t
         instr.id = insn[0].id;
 
         block.instructions.push_back(instr);
-        uint64_t next_address = elfFile.current_offset + insn[0].size;
-        visited.insert({elfFile.current_offset, insn[0].size});
 
+        visited_instructions.insert(current_offset);
+
+        uint64_t next_address = current_offset + insn[0].size;
+
+        bool is_control_flow = false;
         if (instr.details && instr.details->groups_count > 0)
         {
             for (int i = 0; i < instr.details->groups_count; ++i)
             {
                 uint8_t group = instr.details->groups[i];
-                if (group == CS_GRP_JUMP || group == CS_GRP_CALL || group == CS_GRP_RET || group == CS_GRP_INT || instr.mnemonic =="hlt")
+                if (group == CS_GRP_JUMP || group == CS_GRP_CALL || group == CS_GRP_RET || group == CS_GRP_INT || instr.mnemonic == "hlt")
                 {
-                    if (group == CS_GRP_JUMP && instr.details->x86.op_count > 0)
+                    is_control_flow = true;
+
+                    if (instr.mnemonic == "jmp" && instr.details->x86.op_count > 0)
                     {
                         cs_x86_op op = instr.details->x86.operands[0];
                         if (op.type == X86_OP_IMM)
@@ -190,24 +244,48 @@ Block disassemble_block(csh handle, ELFFile &elfFile, std::map<uint64_t, uint8_t
                             block.successors.insert(op.imm);
                         }
                     }
-
-                    if (instr.mnemonic != "jmp")
+                    else if (group == CS_GRP_JUMP && instr.details->x86.op_count > 0)
                     {
-                        block.successors.insert(elfFile.current_offset + insn[0].size);
+                        cs_x86_op op = instr.details->x86.operands[0];
+                        if (op.type == X86_OP_IMM)
+                        {
+                            block.successors.insert(op.imm);
+                            block.successors.insert(next_address);
+                        }
                     }
-                    block.end_address = next_address;
-                    block.isReturn = (group == CS_GRP_RET || instr.mnemonic == "hlt");
-                    cs_free(insn, count);
-                    return block;
+                    else if (group == CS_GRP_CALL && instr.details->x86.op_count > 0)
+                    {
+                        block.successors.insert(next_address);
+                        is_control_flow = true;
+                    }
+                    else if (group == CS_GRP_RET)
+                    {
+                        block.isReturn = true;
+                    }
+                    else if (instr.mnemonic == "hlt")
+                    {
+                        block.isReturn = true;
+                    }
+                    else if (group == CS_GRP_INT)
+                    {
+                        is_control_flow = false;
+                    }
                 }
             }
         }
 
-        elfFile.current_offset = next_address;
+        if (is_control_flow)
+        {
+            block.end_address = next_address;
+            cs_free(insn, count);
+            return block;
+        }
+
+        current_offset = next_address;
         cs_free(insn, count);
     }
 
-    block.end_address = elfFile.current_offset;
+    block.end_address = current_offset;
     return block;
 }
 
@@ -233,7 +311,6 @@ int main(int argc, char *argv[])
     }
 
     std::cout << "Entry offset: 0x" << std::hex << elfFile.entry_offset << std::endl;
-    elfFile.current_offset = elfFile.entry_offset;
     std::vector<Symbol> symbols = parseSymbolTable(elfFile);
     disassemble_symbols(elfFile, symbols);
     return 0;

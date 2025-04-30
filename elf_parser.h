@@ -11,7 +11,6 @@ struct ELFFile
 {
     std::vector<uint8_t> data;
     uint64_t entry_offset;
-    uint64_t current_offset;
     uint64_t dymsym_header_offset;
     uint64_t sym_header_offset;
 };
