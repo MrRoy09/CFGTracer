@@ -9,11 +9,13 @@
 #include <map>
 #include <sstream>
 #include <queue>
+
 #include "elf_parser.h"
 
 struct Instruction
 {
     uint64_t address;
+    uint8_t size;
     std::string mnemonic;
     std::string op_str;
     cs_detail *details;
@@ -85,7 +87,7 @@ void exportCFGToDOT(const std::map<uint64_t, Block> &blocks, const std::string &
     std::cout << "CFG exported to " << filename << ".dot\n";
 }
 
-Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t start_address, std::set<uint64_t> &visited_instructions);
+Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t start_address);
 void disassemble_function_recursive(csh handle, ELFFile &elfFile, Function &function, uint64_t start_address);
 
 void disassemble_symbols(ELFFile &elfFile, std::vector<Symbol> &symbols)
@@ -114,18 +116,58 @@ void disassemble_symbols(ELFFile &elfFile, std::vector<Symbol> &symbols)
 
         printf("\nDisassembled %s - Found %zu blocks\n", symbol.name.c_str(), function.blocks.size());
 
-        exportCFGToDOT(function.blocks, function.name+".dot");
+        exportCFGToDOT(function.blocks, function.name);
     }
 
     cs_close(&handle);
 }
 
+Block split_block(Function &function, uint64_t block_addr, uint64_t split_address)
+{
+    Block &original_block = function.blocks[block_addr];
+    Block new_block;
+
+    new_block.start_address = split_address;
+    new_block.end_address = original_block.end_address;
+
+    size_t split_idx = 0;
+    while (split_idx < original_block.instructions.size() &&
+           original_block.instructions[split_idx].address < split_address)
+    {
+        split_idx++;
+    }
+
+    for (size_t i = split_idx; i < original_block.instructions.size(); i++)
+    {
+        new_block.instructions.push_back(original_block.instructions[i]);
+    }
+
+    original_block.instructions.resize(split_idx);
+
+    if (!original_block.instructions.empty())
+    {
+        Instruction &last_instr = original_block.instructions.back();
+        original_block.end_address = last_instr.address + last_instr.size;
+    }
+    else
+    {
+        original_block.end_address = split_address;
+    }
+
+    new_block.successors = original_block.successors;
+
+    original_block.successors.clear();
+    original_block.successors.insert(split_address);
+
+    new_block.predecessors.insert(block_addr);
+
+    return new_block;
+}
+
 void disassemble_function_recursive(csh handle, ELFFile &elfFile, Function &function, uint64_t start_address)
 {
-    std::set<uint64_t> visited_instructions;
     std::set<uint64_t> pending_addresses;
     std::set<uint64_t> processed_block_starts;
-
     pending_addresses.insert(start_address);
 
     while (!pending_addresses.empty())
@@ -141,21 +183,36 @@ void disassemble_function_recursive(csh handle, ELFFile &elfFile, Function &func
         processed_block_starts.insert(current_address);
 
         bool found_in_block = false;
+        uint64_t containing_block_addr;
         for (const auto &[block_addr, block] : function.blocks)
         {
-            if (current_address >= block.start_address && current_address < block.end_address)
+            if (current_address > block.start_address && current_address < block.end_address)
             {
                 found_in_block = true;
+                containing_block_addr = block_addr;
                 break;
             }
         }
 
         if (found_in_block)
         {
+            Block new_block = split_block(function,containing_block_addr,current_address);
+
+            function.blocks[current_address] = new_block;
+
+            for (uint64_t succ : new_block.successors)
+            {
+                if (function.blocks.count(succ) > 0)
+                {
+                    function.blocks[succ].predecessors.insert(current_address);
+                }
+                pending_addresses.insert(succ);
+            }
+
             continue;
         }
 
-        Block block = disassemble_block(handle, elfFile, current_address, visited_instructions);
+        Block block = disassemble_block(handle, elfFile, current_address);
 
         if (!block.instructions.empty())
         {
@@ -185,7 +242,7 @@ void disassemble_function_recursive(csh handle, ELFFile &elfFile, Function &func
     }
 }
 
-Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t start_address, std::set<uint64_t> &visited_instructions)
+Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t start_address)
 {
     Block block;
     block.start_address = start_address;
@@ -194,12 +251,6 @@ Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t start_address, st
 
     while (true)
     {
-        if (visited_instructions.count(current_offset))
-        {
-            block.end_address = current_offset;
-            return block;
-        }
-
         size_t count = cs_disasm(handle, elfFile.data.data() + current_offset,
                                  elfFile.data.size() - current_offset, current_offset, 1, &insn);
 
@@ -215,14 +266,13 @@ Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t start_address, st
 
         Instruction instr;
         instr.address = insn[0].address;
+        instr.size = insn[0].size;
         instr.mnemonic = insn[0].mnemonic;
         instr.op_str = insn[0].op_str;
         instr.details = insn[0].detail;
         instr.id = insn[0].id;
 
         block.instructions.push_back(instr);
-
-        visited_instructions.insert(current_offset);
 
         uint64_t next_address = current_offset + insn[0].size;
 
@@ -236,21 +286,23 @@ Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t start_address, st
                 {
                     is_control_flow = true;
 
-                    if (instr.mnemonic == "jmp" && instr.details->x86.op_count > 0)
+                    if (group == CS_GRP_JUMP && instr.details->x86.op_count > 0)
                     {
                         cs_x86_op op = instr.details->x86.operands[0];
                         if (op.type == X86_OP_IMM)
                         {
-                            block.successors.insert(op.imm);
-                        }
-                    }
-                    else if (group == CS_GRP_JUMP && instr.details->x86.op_count > 0)
-                    {
-                        cs_x86_op op = instr.details->x86.operands[0];
-                        if (op.type == X86_OP_IMM)
-                        {
-                            block.successors.insert(op.imm);
-                            block.successors.insert(next_address);
+                            // Check if the instruction is an unconditional jump (like "jmp")
+                            if (instr.mnemonic == "jmp")
+                            {
+                                // Unconditional: only one successor (the target)
+                                block.successors.insert(op.imm);
+                            }
+                            else
+                            {
+                                // Conditional: two successors (target and fall-through)
+                                block.successors.insert(op.imm);       // jump taken
+                                block.successors.insert(next_address); // fall-through
+                            }
                         }
                     }
                     else if (group == CS_GRP_CALL && instr.details->x86.op_count > 0)
@@ -266,10 +318,6 @@ Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t start_address, st
                     {
                         block.isReturn = true;
                     }
-                    else if (group == CS_GRP_INT)
-                    {
-                        is_control_flow = false;
-                    }
                 }
             }
         }
@@ -284,9 +332,6 @@ Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t start_address, st
         current_offset = next_address;
         cs_free(insn, count);
     }
-
-    block.end_address = current_offset;
-    return block;
 }
 
 int main(int argc, char *argv[])

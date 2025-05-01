@@ -71,7 +71,6 @@ std::vector<Symbol> parseSymbolTable(ELFFile &elfFile)
 
     Elf64_Ehdr *header = reinterpret_cast<Elf64_Ehdr *>(elfFile.data.data());
     Elf64_Shdr *section_headers = reinterpret_cast<Elf64_Shdr *>(elfFile.data.data() + header->e_shoff);
-    const char *shstrtab = reinterpret_cast<const char *>(elfFile.data.data() + section_headers[header->e_shstrndx].sh_offset);
 
     for (int i = 0; i < header->e_shnum; ++i)
     {
