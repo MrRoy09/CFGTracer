@@ -20,6 +20,11 @@ struct Instruction
     std::string op_str;
     cs_detail *details;
     uint32_t id;
+
+    ~Instruction()
+    {
+        delete details;
+    }
 };
 
 struct Block
