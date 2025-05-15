@@ -1,0 +1,9 @@
+makefile
+main
+.gdb_history
+.vscode
+main_cfg*
+*_cfg*
+*.dot
+*.png
+*.o

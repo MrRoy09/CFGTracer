@@ -9,7 +9,7 @@
 #include <map>
 #include <sstream>
 #include <queue>
-
+#include "string.h"
 #include "elf_parser.h"
 
 struct Instruction
@@ -196,7 +196,7 @@ void disassemble_function_recursive(csh handle, ELFFile &elfFile, Function &func
 
         if (found_in_block)
         {
-            Block new_block = split_block(function,containing_block_addr,current_address);
+            Block new_block = split_block(function, containing_block_addr, current_address);
 
             function.blocks[current_address] = new_block;
 
@@ -269,7 +269,16 @@ Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t start_address)
         instr.size = insn[0].size;
         instr.mnemonic = insn[0].mnemonic;
         instr.op_str = insn[0].op_str;
-        instr.details = insn[0].detail;
+        if (insn[0].detail)
+        {
+            cs_detail *detail_copy = new cs_detail;
+            memcpy(detail_copy, insn[0].detail, sizeof(cs_detail));
+            instr.details = detail_copy;
+        }
+        else
+        {
+            instr.details = nullptr;
+        }
         instr.id = insn[0].id;
 
         block.instructions.push_back(instr);
