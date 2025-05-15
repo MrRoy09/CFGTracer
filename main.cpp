@@ -18,13 +18,13 @@ struct Instruction
     uint8_t size;
     std::string mnemonic;
     std::string op_str;
-    cs_detail *details;
     uint32_t id;
 
-    ~Instruction()
-    {
-        delete details;
-    }
+    uint8_t groups[8];
+    uint8_t groups_count = 0;
+
+    cs_x86_op operands[8];
+    uint8_t op_count = 0;
 };
 
 struct Block
@@ -274,61 +274,52 @@ Block disassemble_block(csh handle, ELFFile &elfFile, uint64_t start_address)
         instr.size = insn[0].size;
         instr.mnemonic = insn[0].mnemonic;
         instr.op_str = insn[0].op_str;
+        instr.id = insn[0].id;
+
         if (insn[0].detail)
         {
-            cs_detail *detail_copy = new cs_detail;
-            memcpy(detail_copy, insn[0].detail, sizeof(cs_detail));
-            instr.details = detail_copy;
+            instr.groups_count = insn[0].detail->groups_count;
+            memcpy(instr.groups, insn[0].detail->groups, sizeof(instr.groups));
+
+            instr.op_count = insn[0].detail->x86.op_count;
+            memcpy(instr.operands, insn[0].detail->x86.operands, sizeof(cs_x86_op) * instr.op_count);
         }
-        else
-        {
-            instr.details = nullptr;
-        }
-        instr.id = insn[0].id;
 
         block.instructions.push_back(instr);
 
         uint64_t next_address = current_offset + insn[0].size;
 
         bool is_control_flow = false;
-        if (instr.details && instr.details->groups_count > 0)
+        if (instr.groups_count > 0)
         {
-            for (int i = 0; i < instr.details->groups_count; ++i)
+            for (int i = 0; i < instr.groups_count; ++i)
             {
-                uint8_t group = instr.details->groups[i];
+                uint8_t group = instr.groups[i];
                 if (group == CS_GRP_JUMP || group == CS_GRP_CALL || group == CS_GRP_RET || group == CS_GRP_INT || instr.mnemonic == "hlt")
                 {
                     is_control_flow = true;
 
-                    if (group == CS_GRP_JUMP && instr.details->x86.op_count > 0)
+                    if (group == CS_GRP_JUMP && instr.op_count > 0)
                     {
-                        cs_x86_op op = instr.details->x86.operands[0];
+                        cs_x86_op op = instr.operands[0];
                         if (op.type == X86_OP_IMM)
                         {
-                            // Check if the instruction is an unconditional jump (like "jmp")
                             if (instr.mnemonic == "jmp")
                             {
-                                // Unconditional: only one successor (the target)
                                 block.successors.insert(op.imm);
                             }
                             else
                             {
-                                // Conditional: two successors (target and fall-through)
-                                block.successors.insert(op.imm);       // jump taken
-                                block.successors.insert(next_address); // fall-through
+                                block.successors.insert(op.imm);
+                                block.successors.insert(next_address);
                             }
                         }
                     }
-                    else if (group == CS_GRP_CALL && instr.details->x86.op_count > 0)
+                    else if (group == CS_GRP_CALL)
                     {
                         block.successors.insert(next_address);
-                        is_control_flow = true;
                     }
-                    else if (group == CS_GRP_RET)
-                    {
-                        block.isReturn = true;
-                    }
-                    else if (instr.mnemonic == "hlt")
+                    else if (group == CS_GRP_RET || instr.mnemonic == "hlt")
                     {
                         block.isReturn = true;
                     }
